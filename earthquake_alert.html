@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Earthquake Alert — M≥4.0</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-sA+e2XkGk0y9w3s2kqjv2gqQ5bQv1pF5Qf5p3v0g5mM=" crossorigin=""/>
+  <style>
+    :root{--accent:#ff4d4f}
+    html,body,#map{height:100%;margin:0;padding:0}
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;display:flex;flex-direction:column}
+    header{background:#0b1220;color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px}
+    header h1{font-size:18px;margin:0}
+    #container{display:flex;flex:1;min-height:0}
+    #map{flex:1}
+    #side{width:360px;background:#f7f8fa;border-left:1px solid #e6e9ee;display:flex;flex-direction:column;padding:12px;box-sizing:border-box}
+    .control{margin-bottom:10px}
+    label{font-size:13px;color:#222}
+    input,button,select{width:100%;padding:8px;margin-top:6px;border-radius:6px;border:1px solid #ddd}
+    button{cursor:pointer;background:var(--accent);color:#fff;border:none}
+    .list{overflow:auto;flex:1;padding-top:6px}
+    .quake{Padding:8px;border-radius:6px;border:1px solid #e6e9ee;margin-bottom:8px;background:#fff}
+    .alerting{box-shadow:0 0 0 4px rgba(255,77,79,0.06)}
+    .muted{opacity:0.5}
+    footer{padding:8px;font-size:12px;color:#666;text-align:center}
+    .badge{display:inline-block;background:#111;color:#fff;padding:3px 8px;border-radius:999px;font-size:12px}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Earthquake Alert Web App</h1>
+    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+      <div class="badge">Source: USGS GeoJSON</div>
+    </div>
+  </header>
+  <div id="container">
+    <div id="map"></div>
+    <aside id="side">
+      <div class="control">
+        <label for="threshold">Alert magnitude threshold (M)</label>
+        <select id="threshold">
+          <option value="4">4.0</option>
+          <option value="4.5">4.5</option>
+          <option value="5">5.0</option>
+        </select>
+      </div>
+      <div class="control">
+        <label for="radius">Radius to alert (km) — leave empty for global</label>
+        <input id="radius" placeholder="e.g. 300" />
+      </div>
+      <div class="control">
+        <label>Your location (optional — used to compute distance)</label>
+        <input id="loc" placeholder="Click 'Use my location' or enter lat,lon" />
+        <div style="display:flex;gap:8px;margin-top:6px">
+          <button id="usegeo" style="flex:1;background:#2b7a78">Use my location</button>
+          <button id="clearloc" style="flex:1;background:#6b7280">Clear</button>
+        </div>
+      </div>
+      <div class="control">
+        <button id="mute">Mute Alert</button>
+      </div>
+      <div class="control">
+        <small>Last updated: <span id="last">—</span></small>
+      </div>
+
+      <div class="list" id="quakelist">
+        <!-- quake items -->
+      </div>
+      <footer>
+        Uses live USGS GeoJSON feeds (updated frequently). PHIVOLCS is the official Philippine source—check PHIVOLCS for local official bulletins. 
+      </footer>
+    </aside>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-o9N1j8kHcGkG2bqD2pH2mN0z1l6tP4Yk3Qb9+8mTkeI=" crossorigin=""></script>
+  <script>
+    // Configuration
+    const USGS_URL = 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_hour.geojson';
+    const POLL_MS = 30000; // 30s
+
+    // State
+    let map, markersLayer;
+    let seen = new Set(JSON.parse(localStorage.getItem('seen_quakes')||'[]'));
+    let muted = false;
+
+    // Initialize map
+    function initMap(){
+      map = L.map('map').setView([12.8797,121.7740], 5); // Philippines-ish default
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+      }).addTo(map);
+      markersLayer = L.layerGroup().addTo(map);
+    }
+
+    // Utility: haversine
+    function haversineKm(lat1,lon1,lat2,lon2){
+      const R=6371; const toRad=(d)=>d*Math.PI/180;
+      const dLat=toRad(lat2-lat1); const dLon=toRad(lon2-lon1);
+      const a=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)*Math.sin(dLon/2);
+      return R*2*Math.asin(Math.sqrt(a));
+    }
+
+    // Play alert tone using WebAudio (no external file)
+    function playTone(secs=4){
+      if(muted) return;
+      try{
+        const ctx=new (window.AudioContext||window.webkitAudioContext)();
+        const o=ctx.createOscillator();
+        const g=ctx.createGain();
+        o.type='sine'; o.frequency.value=880;
+        o.connect(g); g.connect(ctx.destination);
+        o.start();
+        g.gain.setValueAtTime(0.0001, ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime+0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime+secs);
+        o.stop(ctx.currentTime+secs+0.1);
+      }catch(e){console.warn('Audio not supported',e)}
+    }
+
+    // UI helpers
+    const quakelist = document.getElementById('quakelist');
+    function addQuakeToList(q){
+      const el=document.createElement('div'); el.className='quake';
+      const mag=q.properties.mag.toFixed(1);
+      const place=q.properties.place||'unknown location';
+      const time=new Date(q.properties.time).toLocaleString();
+      const id=q.id;
+      const coords=q.geometry.coordinates; // [lon,lat,depth]
+      let dist='—';
+      const locInput=document.getElementById('loc').value.trim();
+      if(locInput){
+        const parts=locInput.split(',');
+        if(parts.length===2){
+          const lat=parseFloat(parts[0]); const lon=parseFloat(parts[1]);
+          if(!isNaN(lat)&&!isNaN(lon)) dist=Math.round(haversineKm(lat,lon,coords[1],coords[0]))+ ' km';
+        }
+      }
+      el.innerHTML=`<strong>M ${mag}</strong> — ${place} <div style="font-size:12px;color:#666;margin-top:6px">${time} · ${dist}</div>`;
+      el.addEventListener('click',()=>{
+        map.setView([coords[1],coords[0]],6);
+      });
+      quakelist.prepend(el);
+      // keep list reasonable length
+      while(quakelist.children.length>80) quakelist.removeChild(quakelist.lastChild);
+    }
+
+    // Add marker
+    function addMarker(q){
+      const coords=q.geometry.coordinates; const lon=coords[0], lat=coords[1];
+      const mag=q.properties.mag||0;
+      const color = mag>=6 ? '#7f0000' : mag>=5 ? '#ff4d4f' : '#ffb84d';
+      const circle = L.circle([lat,lon],{radius: Math.max(5000, mag*8000), color: color, fillOpacity:0.3}).bindPopup(`<strong>M ${mag.toFixed(1)}</strong><br/>${q.properties.place}<br/>${new Date(q.properties.time).toLocaleString()}`);
+      circle.addTo(markersLayer);
+    }
+
+    // Core: fetch and process feed
+    async function pollFeed(){
+      try{
+        const res = await fetch(USGS_URL);
+        const data = await res.json();
+        document.getElementById('last').textContent = new Date().toLocaleString();
+        const threshold = parseFloat(document.getElementById('threshold').value);
+        const radiusVal = document.getElementById('radius').value.trim();
+        let radius = radiusVal? parseFloat(radiusVal) : null;
+        const locInput=document.getElementById('loc').value.trim();
+        let userLat=null,userLon=null;
+        if(locInput){ const p=locInput.split(','); if(p.length===2){userLat=parseFloat(p[0]);userLon=parseFloat(p[1]);}}
+
+        data.features.forEach(f=>{
+          const id=f.id; if(seen.has(id)) return; // skip if already shown
+          seen.add(id);
+          // store seen list in localStorage
+          try{ localStorage.setItem('seen_quakes', JSON.stringify(Array.from(seen))); }catch(e){}
+
+          // add marker and list
+          addMarker(f);
+          addQuakeToList(f);
+
+          // decide alert
+          const mag=f.properties.mag||0;
+          let withinRadius=true;
+          if(radius!=null && userLat!=null && userLon!=null){
+            const dist = haversineKm(userLat,userLon,f.geometry.coordinates[1],f.geometry.coordinates[0]);
+            withinRadius = dist <= radius;
+          }
+          if(mag >= threshold && withinRadius){
+            // visual flash
+            flashSide();
+            // sound
+            playTone(5);
+            // optionally center map on event briefly
+            map.setView([f.geometry.coordinates[1], f.geometry.coordinates[0]],6);
+          }
+        });
+      }catch(err){ console.error('Feed error',err); }
+      setTimeout(pollFeed, POLL_MS);
+    }
+
+    function flashSide(){
+      const s=document.getElementById('side');
+      s.classList.add('alerting'); setTimeout(()=>s.classList.remove('alerting'),4000);
+    }
+
+    // Buttons
+    document.getElementById('usegeo').addEventListener('click', ()=>{
+      if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
+      navigator.geolocation.getCurrentPosition(pos=>{
+        const lat=pos.coords.latitude.toFixed(6); const lon=pos.coords.longitude.toFixed(6);
+        document.getElementById('loc').value = lat+','+lon;
+      }, err=>{ alert('Unable to get location: '+err.message); });
+    });
+    document.getElementById('clearloc').addEventListener('click', ()=>{ document.getElementById('loc').value=''; });
+    document.getElementById('mute').addEventListener('click', ()=>{ muted=!muted; document.getElementById('mute').textContent = muted? 'Unmute Alert' : 'Mute Alert'; if(muted) document.body.classList.add('muted'); else document.body.classList.remove('muted'); });
+
+    // init
+    initMap(); pollFeed();
+
+  </script>
+</body>
+</html>
